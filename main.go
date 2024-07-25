@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 )
 
@@ -19,7 +18,7 @@ type Task struct {
 
 // Збереження списку завдань у пам'яті
 var (
-	tasks  = []Task{}
+	tasks  = map[int]Task{}
 	nextID = 1
 	mutex  sync.Mutex
 )
@@ -29,7 +28,14 @@ func getTasks(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	mutex.Lock()
 	defer mutex.Unlock()
-	json.NewEncoder(w).Encode(tasks)
+
+	// Перетворюємо map в slice для виводу
+	var taskList []Task
+	for _, task := range tasks {
+		taskList = append(taskList, task)
+	}
+
+	json.NewEncoder(w).Encode(taskList)
 }
 
 // Обробник для додавання нового завдання
@@ -43,7 +49,7 @@ func addTask(w http.ResponseWriter, r *http.Request) {
 	mutex.Lock()
 	task.ID = nextID
 	nextID++
-	tasks = append(tasks, task)
+	tasks[task.ID] = task
 	mutex.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -52,7 +58,7 @@ func addTask(w http.ResponseWriter, r *http.Request) {
 
 // Обробник для зміни існуючого завдання
 func updateTask(w http.ResponseWriter, r *http.Request) {
-	idStr := strings.TrimPrefix(r.URL.Path, "/tasks/")
+	idStr := r.URL.Path[len("/tasks/"):]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid task ID", http.StatusBadRequest)
@@ -68,21 +74,21 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 
 	mutex.Lock()
 	defer mutex.Unlock()
-	for i, task := range tasks {
-		if task.ID == id {
-			tasks[i].Name = updatedTask.Name
-			tasks[i].Completed = updatedTask.Completed
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(tasks[i])
-			return
-		}
+	if task, exists := tasks[id]; exists {
+		task.Name = updatedTask.Name
+		task.Completed = updatedTask.Completed
+		tasks[id] = task
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(task)
+		return
 	}
+
 	http.Error(w, "Task not found", http.StatusNotFound)
 }
 
 // Обробник для видалення завдання
 func deleteTask(w http.ResponseWriter, r *http.Request) {
-	idStr := strings.TrimPrefix(r.URL.Path, "/tasks/")
+	idStr := r.URL.Path[len("/tasks/"):]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid task ID", http.StatusBadRequest)
@@ -91,18 +97,19 @@ func deleteTask(w http.ResponseWriter, r *http.Request) {
 
 	mutex.Lock()
 	defer mutex.Unlock()
-	for i, task := range tasks {
-		if task.ID == id {
-			tasks = append(tasks[:i], tasks[i+1:]...)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+	if _, exists := tasks[id]; exists {
+		delete(tasks, id)
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
+
 	http.Error(w, "Task not found", http.StatusNotFound)
 }
 
 func main() {
-	http.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			getTasks(w, r)
@@ -113,7 +120,7 @@ func main() {
 		}
 	})
 
-	http.HandleFunc("/tasks/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/tasks/", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
 			updateTask(w, r)
@@ -131,6 +138,8 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("Сервер працює на порту %d\n", listener.Addr().(*net.TCPAddr).Port)
-	log.Fatal(http.Serve(listener, nil))
+	port := listener.Addr().(*net.TCPAddr).Port
+	log.Printf("Сервер працює на порту %d\n", port)
+
+	log.Fatal(http.Serve(listener, mux))
 }
