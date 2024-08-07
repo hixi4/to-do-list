@@ -5,159 +5,161 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"strconv"
 	"sync"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-redis/redis/v8"
 )
 
-// Структура для завдання
+var rdb *redis.Client
+var tasksMutex sync.Mutex
+
 type Task struct {
-	ID        int    `json:"id"`
-	Name      string `json:"name"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
 	Completed bool   `json:"completed"`
 }
 
-// Збереження списку завдань у пам'яті
-var (
-	tasks  = map[int]Task{}
-	nextID = 1
-	mutex  sync.Mutex
-)
+var tasks = make(map[string]Task)
 
-// Обробник для отримання списку завдань
-func getTasks(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func main() {
+	// Initialize Redis client
+	rdb = redis.NewClient(&redis.Options{
+		Addr: "localhost:6379", // use default Addr
+		DB:   0,                // use default DB
+	})
 
-	mutex.Lock()
-	taskList := make([]Task, 0, len(tasks))
-	for _, task := range tasks {
-		taskList = append(taskList, task)
+	// Check Redis connection
+	ctx := context.Background()
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Could not connect to Redis: %v", err)
 	}
-	mutex.Unlock()
 
-	if err := json.NewEncoder(w).Encode(taskList); err != nil {
-		http.Error(w, "Error encoding response: "+err.Error(), http.StatusInternalServerError)
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Get("/tasks", getTasks)
+	r.Post("/tasks", createTask)
+	r.Put("/tasks/{id}", updateTask)
+	r.Delete("/tasks/{id}", deleteTask)
+
+	fmt.Println("Server is running on port 8080")
+	log.Fatal(http.ListenAndServe(":8080", r))
+}
+
+func getTasks(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	val, err := rdb.Get(ctx, "tasks").Result()
+	if err == redis.Nil {
+		// Cache miss, fetch from "database"
+		tasksMutex.Lock()
+		taskList := make([]Task, 0, len(tasks))
+		for _, task := range tasks {
+			taskList = append(taskList, task)
+		}
+		tasksMutex.Unlock()
+
+		// Store in Redis cache
+		jsonData, err := json.Marshal(taskList)
+		if err != nil {
+			http.Error(w, "Error encoding tasks: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		err = rdb.Set(ctx, "tasks", jsonData, time.Minute*10).Err()
+		if err != nil {
+			http.Error(w, "Error setting Redis cache: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Return response
+		w.Header().Set("Content-Type", "application/json")
+		_, err = w.Write(jsonData)
+		if err != nil {
+			http.Error(w, "Error writing response: "+err.Error(), http.StatusInternalServerError)
+		}
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else {
+		// Cache hit, return cached data
+		w.Header().Set("Content-Type", "application/json")
+		_, err = w.Write([]byte(val))
+		if err != nil {
+			http.Error(w, "Error writing response: "+err.Error(), http.StatusInternalServerError)
+		}
 	}
 }
 
-// Обробник для додавання нового завдання
-func addTask(w http.ResponseWriter, r *http.Request) {
+func createTask(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
 	var task Task
 	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
-		http.Error(w, "Invalid request payload: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	mutex.Lock()
-	task.ID = nextID
-	nextID++
+	tasksMutex.Lock()
 	tasks[task.ID] = task
-	mutex.Unlock()
+	tasksMutex.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
+	// Invalidate Redis cache
+	err := rdb.Del(ctx, "tasks").Err()
+	if err != nil {
+		http.Error(w, "Error deleting Redis cache: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(task); err != nil {
-		http.Error(w, "Error encoding response: "+err.Error(), http.StatusInternalServerError)
-	}
 }
 
-// Обробник для зміни існуючого завдання
 func updateTask(w http.ResponseWriter, r *http.Request) {
-	idStr := r.URL.Path[len("/tasks/"):]
-	id, err := strconv.Atoi(idStr)
+	ctx := r.Context()
+	id := chi.URLParam(r, "id")
+
+	var task Task
+	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	task.ID = id
+
+	tasksMutex.Lock()
+	tasks[id] = task
+	tasksMutex.Unlock()
+
+	// Invalidate Redis cache
+	err := rdb.Del(ctx, "tasks").Err()
 	if err != nil {
-		http.Error(w, "Invalid task ID: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "Error deleting Redis cache: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	var updatedTask Task
-	if err := json.NewDecoder(r.Body).Decode(&updatedTask); err != nil {
-		http.Error(w, "Invalid request payload: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	mutex.Lock()
-	task, exists := tasks[id]
-	if exists {
-		task.Name = updatedTask.Name
-		task.Completed = updatedTask.Completed
-		tasks[id] = task
-	}
-	mutex.Unlock()
-
-	if !exists {
-		http.Error(w, "Task not found", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(task); err != nil {
-		http.Error(w, "Error encoding response: "+err.Error(), http.StatusInternalServerError)
-	}
+	w.WriteHeader(http.StatusOK)
 }
 
-// Обробник для видалення завдання
 func deleteTask(w http.ResponseWriter, r *http.Request) {
-	idStr := r.URL.Path[len("/tasks/"):]
-	id, err := strconv.Atoi(idStr)
+	ctx := r.Context()
+	id := chi.URLParam(r, "id")
+
+	tasksMutex.Lock()
+	delete(tasks, id)
+	tasksMutex.Unlock()
+
+	// Invalidate Redis cache
+	err := rdb.Del(ctx, "tasks").Err()
 	if err != nil {
-		http.Error(w, "Invalid task ID: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	mutex.Lock()
-	_, exists := tasks[id]
-	if exists {
-		delete(tasks, id)
-	}
-	mutex.Unlock()
-
-	if !exists {
-		http.Error(w, "Task not found", http.StatusNotFound)
+		http.Error(w, "Error deleting Redis cache: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func main() {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			getTasks(w, r)
-		case http.MethodPost:
-			addTask(w, r)
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	mux.HandleFunc("/tasks/", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPut:
-			updateTask(w, r)
-		case http.MethodDelete:
-			deleteTask(w, r)
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	// Слухаємо на динамічному порту
-	listener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		log.Fatal("Error starting server: ", err)
-	}
-	defer listener.Close()
-
-	port := listener.Addr().(*net.TCPAddr).Port
-	log.Printf("Сервер працює на порту %d\n", port)
-
-	if err := http.Serve(listener, mux); err != nil {
-		log.Fatal("Server error: ", err)
-	}
-}
 
