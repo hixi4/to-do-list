@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,36 +25,38 @@ type Task struct {
 var tasks = make(map[string]Task)
 
 func main() {
-	// Initialize Redis client
+	// Ініціалізація клієнта Redis
 	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379", // use default Addr
-		DB:   0,                // use default DB
+		Addr: "localhost:6379", // використовується адреса за замовчуванням
+		DB:   0,                // використовується база даних за замовчуванням
 	})
 
-	// Check Redis connection
+	// Перевірка з'єднання з Redis
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
 	if err != nil {
-		log.Fatalf("Could not connect to Redis: %v", err)
+		log.Fatalf("Не вдалося підключитися до Redis: %v", err)
 	}
 
+	// Створення роутера
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
-	r.Get("/tasks", getTasks)
-	r.Post("/tasks", createTask)
-	r.Put("/tasks/{id}", updateTask)
-	r.Delete("/tasks/{id}", deleteTask)
+	r.Get("/tasks", getTasks)       // Маршрут для отримання завдань
+	r.Post("/tasks", createTask)    // Маршрут для створення завдання
+	r.Put("/tasks/{id}", updateTask) // Маршрут для оновлення завдання
+	r.Delete("/tasks/{id}", deleteTask) // Маршрут для видалення завдання
 
-	fmt.Println("Server is running on port 8080")
+	fmt.Println("Сервер працює на порту 8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
+// Функція для отримання всіх завдань
 func getTasks(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := r.Context() // Використання контексту запиту
 
 	val, err := rdb.Get(ctx, "tasks").Result()
 	if err == redis.Nil {
-		// Cache miss, fetch from "database"
+		// Кеш відсутній, отримуємо дані з "бази даних"
 		tasksMutex.Lock()
 		taskList := make([]Task, 0, len(tasks))
 		for _, task := range tasks {
@@ -63,40 +64,41 @@ func getTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		tasksMutex.Unlock()
 
-		// Store in Redis cache
+		// Збереження в кеш Redis
 		jsonData, err := json.Marshal(taskList)
 		if err != nil {
-			http.Error(w, "Error encoding tasks: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Помилка кодування завдань: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		err = rdb.Set(ctx, "tasks", jsonData, time.Minute*10).Err()
 		if err != nil {
-			http.Error(w, "Error setting Redis cache: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Помилка збереження в кеш Redis: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Return response
+		// Повернення відповіді
 		w.Header().Set("Content-Type", "application/json")
 		_, err = w.Write(jsonData)
 		if err != nil {
-			http.Error(w, "Error writing response: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Помилка запису відповіді: "+err.Error(), http.StatusInternalServerError)
 		}
 	} else if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	} else {
-		// Cache hit, return cached data
+		// Кеш наявний, повертаємо кешовані дані
 		w.Header().Set("Content-Type", "application/json")
 		_, err = w.Write([]byte(val))
 		if err != nil {
-			http.Error(w, "Error writing response: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Помилка запису відповіді: "+err.Error(), http.StatusInternalServerError)
 		}
 	}
 }
 
+// Функція для створення нового завдання
 func createTask(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := r.Context() // Використання контексту запиту
 
 	var task Task
 	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
@@ -108,18 +110,19 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 	tasks[task.ID] = task
 	tasksMutex.Unlock()
 
-	// Invalidate Redis cache
+	// Інвалідація кешу Redis
 	err := rdb.Del(ctx, "tasks").Err()
 	if err != nil {
-		http.Error(w, "Error deleting Redis cache: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Помилка видалення кешу Redis: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
 }
 
+// Функція для оновлення існуючого завдання
 func updateTask(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := r.Context() // Використання контексту запиту
 	id := chi.URLParam(r, "id")
 
 	var task Task
@@ -134,32 +137,32 @@ func updateTask(w http.ResponseWriter, r *http.Request) {
 	tasks[id] = task
 	tasksMutex.Unlock()
 
-	// Invalidate Redis cache
+	// Інвалідація кешу Redis
 	err := rdb.Del(ctx, "tasks").Err()
 	if err != nil {
-		http.Error(w, "Error deleting Redis cache: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Помилка видалення кешу Redis: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
 }
 
+// Функція для видалення існуючого завдання
 func deleteTask(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := r.Context() // Використання контексту запиту
 	id := chi.URLParam(r, "id")
 
 	tasksMutex.Lock()
 	delete(tasks, id)
 	tasksMutex.Unlock()
 
-	// Invalidate Redis cache
+	// Інвалідація кешу Redis
 	err := rdb.Del(ctx, "tasks").Err()
 	if err != nil {
-		http.Error(w, "Error deleting Redis cache: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Помилка видалення кешу Redis: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
-
 
